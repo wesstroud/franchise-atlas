@@ -1,0 +1,1487 @@
+{
+  "name": "FDD Ingestion - Franchise Atlas",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/fdd/upload",
+        "responseMode": "lastNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "b9680e66-7dc3-4d4b-8d5b-f147bc7854fa",
+      "name": "Webhook Upload FDD",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -3792,
+        1504
+      ],
+      "webhookId": "0b4260d3-90b2-4511-a81c-f748871bfb6d"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "=file",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3520,
+        1504
+      ],
+      "id": "9e3b62f4-a9a7-4361-a3d7-6986a56ad8a3",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\n\n// OCR-tolerant \"ITEM\" (handles I T E M)\nconst ITEM_WORD_SRC = \"I\\\\s*T\\\\s*E\\\\s*M\";\n\n// Anchor to line starts to reduce false hits in paragraphs\nfunction makeItemStartRegex(itemNumber) {\n  // Handles: \"ITEM 19\", \"ITEM19\", \"I T E M  1 9\"\n  return new RegExp(\n    String.raw`(?:^|\\n)\\s*(?:${ITEM_WORD_SRC})\\s*${String(itemNumber).split(\"\").join(\"\\\\s*\")}\\b`,\n    \"i\"\n  );\n}\n\n// Item start regexes you care about now\nconst item6Start = makeItemStartRegex(6);\nconst item7Start = makeItemStartRegex(7);\nconst item8Start = makeItemStartRegex(8);\nconst item9Start = makeItemStartRegex(9);\n\nconst item19Start = makeItemStartRegex(19);\nconst item20Start = makeItemStartRegex(20);\nconst item21Start = makeItemStartRegex(21);\n\n// --- New: First-page / preamble extraction ---\n// We want everything from the beginning up to the heading:\n// \"How to use this franchise disclosure document\"\nconst HOW_TO_USE_ANCHOR = /(?:^|\\n)\\s*HOW\\s+TO\\s+USE\\s+THIS\\s+FRANCHISE\\s+DISCLOSURE\\s+DOCUMENT\\b/i;\n\nfunction extractUpTo(fullText, endRegex) {\n  if (!fullText) return \"\";\n  const m = fullText.match(endRegex);\n  if (!m || m.index == null) return \"\";\n  return fullText.slice(0, m.index).trim();\n}\n\n// Rough TOC end markers (use multiple because formats vary)\nconst tocStart = /(?:^|\\n)\\s*TABLE\\s+OF\\s+CONTENTS\\b/i;\nconst tocEnd = /(?:^|\\n)\\s*(?:ITEM\\s*23\\b|EXHIBIT\\s+\"?A\"?\\b|EXHIBIT\\s+A\\b)\\s/i;\n\nfunction stripTableOfContents(fullText) {\n  if (!fullText) return \"\";\n\n  const tocStartMatch = fullText.match(tocStart);\n  if (!tocStartMatch || tocStartMatch.index == null) return fullText;\n\n  // Only consider TOC in the early part of the doc (avoid weird later headings)\n  if (tocStartMatch.index > 200000) return fullText;\n\n  const afterToc = fullText.slice(tocStartMatch.index);\n  const tocEndMatch = afterToc.match(tocEnd);\n\n  if (!tocEndMatch || tocEndMatch.index == null) {\n    // If we can't find the end, don't strip (safer than deleting half the doc)\n    return fullText;\n  }\n\n  // Remove everything from TOC start through TOC end marker line\n  const cutIndex = tocStartMatch.index + tocEndMatch.index;\n  return fullText.slice(cutIndex);\n}\n\nfunction extractBetween(fullText, startRegex, endRegex) {\n  const startMatch = fullText.match(startRegex);\n  if (!startMatch || startMatch.index == null) return \"\";\n\n  const startIndex = startMatch.index;\n  const remaining = fullText.slice(startIndex);\n\n  const endMatch = remaining.match(endRegex);\n  if (endMatch && endMatch.index != null) {\n    return remaining.slice(0, endMatch.index).trim();\n  }\n  return remaining.trim();\n}\n\n// Optional: cap size before sending to AI\nfunction capText(text, maxChars) {\n  if (!text) return \"\";\n  if (text.length <= maxChars) return text;\n  return text.slice(0, maxChars) + `\\n\\n[TRUNCATED at ${maxChars} chars]\\n`;\n}\n\nfor (const item of items) {\n  const brand = item.json.brand;\n  const year = item.json.year;\n  const sha256 = item.json.sha256;\n\n  const fullTextRaw = item.json.text || \"\";\n  const pageCount = item.json.numpages ?? item.json.numrender ?? null;\n\n  // 1) Strip TOC to avoid false hits early (mostly impacts ITEM searches)\n  const fullText = stripTableOfContents(fullTextRaw);\n\n  // --- First page / preamble (beginning -> \"How to use...\" heading) ---\n  // NOTE: We intentionally run this on fullTextRaw (pre-TOC-strip) so we don't\n  // accidentally delete the first page if a TOC appears very early.\n  const firstPageText = extractUpTo(fullTextRaw, HOW_TO_USE_ANCHOR);\n  const firstPageForAi = capText(firstPageText, 60000);\n\n  // --- Item 6 and Item 7 ---\n  // Item 6: ITEM 6 -> ITEM 7\n  const item6Text = extractBetween(fullText, item6Start, item7Start);\n\n  // Item 7: ITEM 7 -> ITEM 8 (preferred), else -> ITEM 9\n  let item7Text = extractBetween(fullText, item7Start, item8Start);\n  if (!item7Text) {\n    item7Text = extractBetween(fullText, item7Start, item9Start);\n  }\n\n  // --- Item 19 and Item 20 ---\n  const item19Text = extractBetween(fullText, item19Start, item20Start);\n  const item20Text = extractBetween(fullText, item20Start, item21Start);\n\n  // 4) Cap payloads for AI\n  const item6ForAi = capText(item6Text, 80000);\n  const item7ForAi = capText(item7Text, 120000);\n  const item19ForAi = capText(item19Text, 120000);\n  const item20ForAi = capText(item20Text, 200000);\n\n  results.push({\n    json: {\n      brand,\n      year,\n      sha256,\n      pageCount,\n\n      firstPageText,\n      firstPageForAi,\n\n      item6Text,\n      item7Text,\n      item19Text,\n      item20Text,\n\n      item6ForAi,\n      item7ForAi,\n      item19ForAi,\n      item20ForAi,\n\n      debug: {\n        fullTextRawLen: fullTextRaw.length,\n        fullTextLenAfterTocStrip: fullText.length,\n\n        firstPageLen: firstPageText.length,\n        firstPageFound: !!firstPageText,\n\n        item6Len: item6Text.length,\n        item7Len: item7Text.length,\n        item19Len: item19Text.length,\n        item20Len: item20Text.length,\n\n        item6Found: !!item6Text,\n        item7Found: !!item7Text,\n        item19Found: !!item19Text,\n        item20Found: !!item20Text\n      }\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3152,
+        1504
+      ],
+      "id": "0ff3c3d3-f2bd-4cb6-babc-afd2c26af89d",
+      "name": "Convert FDD to Text"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5.2",
+          "mode": "list",
+          "cachedResultName": "gpt-5.2"
+        },
+        "builtInTools": {
+          "codeInterpreter": false
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -1808,
+        1248
+      ],
+      "id": "ffdd8509-7fcf-4bf5-8a7e-5185aa739645",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "6inYRlzBlcQUnddu",
+          "name": "Wes Stroud OpenAI Credential (n8n connection)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"brand\": { \"type\": \"string\" },\n    \"year\": { \"type\": [\"number\", \"string\"] },\n    \"startup_cost_low\": { \"type\": [\"number\", \"null\"] },\n    \"startup_cost_high\": { \"type\": [\"number\", \"null\"] },\n    \"royalty_percent\": { \"type\": [\"number\", \"null\"] },\n    \"royalty_minimum_monthly\": { \"type\": [\"number\", \"null\"] },\n    \"brand_fund_percent\": { \"type\": [\"number\", \"null\"] },\n    \"alternate_royalty_structures\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"name\": { \"type\": \"string\" },\n          \"royalty_percent\": { \"type\": [\"number\", \"null\"] },\n          \"royalty_minimum_monthly\": { \"type\": [\"number\", \"null\"] },\n          \"timeframe\": { \"type\": [\"string\", \"null\"] },\n          \"notes\": { \"type\": [\"string\", \"null\"] }\n        },\n        \"required\": [\"name\", \"royalty_percent\", \"royalty_minimum_monthly\", \"timeframe\", \"notes\"]\n      }\n    },\n    \"initial_fees_paid_to_franchisor\": { \"type\": [\"number\", \"null\"] },\n    \"issues\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } },\n    \"confidence_overall\": { \"type\": \"number\" }\n  },\n  \"required\": [\n    \"brand\",\n    \"year\",\n    \"startup_cost_low\",\n    \"startup_cost_high\",\n    \"royalty_percent\",\n    \"royalty_minimum_monthly\",\n    \"brand_fund_percent\",\n    \"alternate_royalty_structures\",\n    \"initial_fees_paid_to_franchisor\",\n    \"issues\",\n    \"confidence_overall\"\n  ]\n}\n"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -1616,
+        1248
+      ],
+      "id": "bc3073b9-1f30-4d84-8dac-5bc01dc07a35",
+      "name": "Structured Output Parser"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=brand: {{ $('Webhook Upload FDD').item.json.body.brandName }}\nyear: {{ $('Webhook Upload FDD').item.json.body.year }}\n\nItem 6 text:\n{{ $('Convert FDD to Text').item.json.item6ForAi }}\n\nItem 7 text:\n{{ $('Convert FDD to Text').item.json.item7ForAi }}\n\nExtract:\n- startup_cost_low, startup_cost_high (USD)\n- initial fees paid to franchisor if explicitly stated (USD) (optional but helpful)\n- royalty_percent (primary/standard), royalty_minimum_monthly if present (USD)\n- brand_fund_percent if present\n- any alternate royalty structures (e.g., ramp-up) as a list\n",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You extract franchise fee and startup investment information from FDD text.\n\nYou will receive:\n- brand and year\n- item6_text (OTHER FEES)\n- item7_text (ESTIMATED INITIAL INVESTMENT)\n\nReturn ONLY a single JSON object that matches the required schema exactly.\nNo prose, no markdown, no explanations.\n\nRules:\n- Use ONLY the provided text. Never guess.\n- If a value is not explicitly stated, use null.\n- Normalize money to numbers in USD (no commas, no $).\n- Normalize percentages to numbers (e.g., 7% -> 7).\n- If royalty is expressed as “greater of X% or $Y minimum”, capture both percent and minimum.\n- If multiple royalty structures exist (e.g., ramp-up incentives), capture the standard structure as primary, and list alternates.\n- Always include keys even if null.\n- Add short strings to issues[] when something is ambiguous or missing.\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -1792,
+        1072
+      ],
+      "id": "bb028a2a-065f-453c-8e42-32a034ec9dea",
+      "name": "Royalty Parser (Items 6 and 7)"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=brand: {{ $('Webhook Upload FDD').item.json.body.brandName }}\nyear: {{ $('Webhook Upload FDD').item.json.body.year }}\n\nItem 19 text:\n{{ $('Convert FDD to Text').item.json.item19ForAi }}\n\nExtract:\n- median_revenue_usd (or closest disclosed median/typical metric)\n- top_revenue_usd (top performer, top tier average, or highest disclosed tier)\n- reporting_period (e.g., fiscal year ended Dec 31, 2024)\n- unit_scope (e.g., franchised clinics, all clinics, comparable units, etc.)\n- basis (e.g., gross sales, total revenues, collections)\n- sample_size if stated\n- short notes for UI context (optional)\n- issues[] for ambiguity/missing items\n",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You extract Item 19 (Financial Performance Representations) data from FDD text.\n\nYou will receive:\n- brand and year\n- item19_text (Item 19 section)\n\nReturn ONLY a single JSON object that matches the required schema exactly.\nNo prose, no markdown, no explanations.\n\nRules:\n- Use ONLY the provided text. Never guess.\n- If a value is not explicitly stated, use null.\n- Revenue values must be numbers in USD (no commas, no $).\n- If multiple revenue metrics exist (e.g., gross sales, collections, net revenue), prefer the metric that best represents location-level revenue and label it.\n- If multiple time periods exist, prefer the most recent full-year period disclosed; otherwise use what is disclosed and note it.\n- If \"top\" is only given as an average of top quartile/decile, capture that value as top_revenue_usd and label it accordingly.\n- Add short strings to issues[] when something is ambiguous, missing, or defined in a non-standard way.\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -1792,
+        1584
+      ],
+      "id": "4fc0f44a-25be-4c4d-a162-0b8883899e30",
+      "name": "Financials Parser (Item 19)"
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"brand\": { \"type\": \"string\" },\n    \"year\": { \"type\": [\"number\", \"string\"] },\n\n    \"reporting_period\": { \"type\": [\"string\", \"null\"] },\n    \"unit_scope\": { \"type\": [\"string\", \"null\"] },\n    \"basis\": { \"type\": [\"string\", \"null\"] },\n\n    \"median_revenue_usd\": { \"type\": [\"number\", \"null\"] },\n    \"top_revenue_usd\": { \"type\": [\"number\", \"null\"] },\n\n    \"median_metric_label\": { \"type\": [\"string\", \"null\"] },\n    \"top_metric_label\": { \"type\": [\"string\", \"null\"] },\n\n    \"sample_size\": { \"type\": [\"number\", \"null\"] },\n\n    \"notes\": { \"type\": [\"string\", \"null\"] },\n\n    \"issues\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } },\n    \"confidence_overall\": { \"type\": \"number\" }\n  },\n  \"required\": [\n    \"brand\",\n    \"year\",\n    \"reporting_period\",\n    \"unit_scope\",\n    \"basis\",\n    \"median_revenue_usd\",\n    \"top_revenue_usd\",\n    \"median_metric_label\",\n    \"top_metric_label\",\n    \"sample_size\",\n    \"notes\",\n    \"issues\",\n    \"confidence_overall\"\n  ]\n}\n"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -1584,
+        1760
+      ],
+      "id": "570a1a95-2647-4226-a2e2-3c88a4075e15",
+      "name": "Structured Output Parser1"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5.2",
+          "mode": "list",
+          "cachedResultName": "gpt-5.2"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -1824,
+        1760
+      ],
+      "id": "8b871693-eb03-47a2-a7b1-6cf1c4871f24",
+      "name": "OpenAI Chat Model1",
+      "credentials": {
+        "openAiApi": {
+          "id": "6inYRlzBlcQUnddu",
+          "name": "Wes Stroud OpenAI Credential (n8n connection)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=brand: {{ $('Webhook Upload FDD').item.json.body.brandName }}\nyear: {{ $('Webhook Upload FDD').item.json.body.year }}\n\nItem 20 text:\n{{ $('Convert FDD to Text').item.json.item20ForAi }}\n\nExtract:\n- as_of_date for Item 20 tables (if present)\n- franchised_total, company_owned_total, total_systemwide\n- franchised_opened, franchised_closed, franchised_transferred\n- company_opened, company_closed\n- whether a franchisee contact list is present (and where), and which fields are listed\n- short notes + issues[] for ambiguity\n",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You extract Item 20 (Outlets and Franchisee Information) data from FDD text.\n\nYou will receive:\n- brand and year\n- item20_text (Item 20 section)\n\nReturn ONLY a single JSON object that matches the required schema exactly.\nNo prose, no markdown, no explanations.\n\nRules:\n- Use ONLY the provided text. Never guess.\n- If a value is not explicitly stated, use null.\n- Item 20 often includes multiple tables for multiple years. Prefer the most recent year disclosed in Item 20.\n- If an \"as of\" date is provided (e.g., Dec 31, 2024), capture it in as_of_date.\n- For totals: if franchised_total and company_owned_total are provided, total_systemwide should equal their sum; if not provided, set total_systemwide to null.\n- For openings/closures/transfers: capture the most recent year counts if clearly stated; otherwise null and add an issue note.\n- Franchisee contact list: indicate whether franchisee names/contact info are present in Item 20 or referenced as an exhibit, and list what fields are included (e.g., name, phone, address, state).\n- Add short strings to issues[] when something is ambiguous, missing, or not extractable due to formatting.\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -1792,
+        2096
+      ],
+      "id": "c797b76b-69cd-47a2-bdd1-e84351a0990c",
+      "name": "Locations Parser (Item 20)"
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"brand\": { \"type\": \"string\" },\n    \"year\": { \"type\": [\"number\", \"string\"] },\n\n    \"as_of_date\": { \"type\": [\"string\", \"null\"] },\n\n    \"outlets\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"franchised_total\": { \"type\": [\"number\", \"null\"] },\n        \"company_owned_total\": { \"type\": [\"number\", \"null\"] },\n        \"total_systemwide\": { \"type\": [\"number\", \"null\"] },\n\n        \"franchised_opened\": { \"type\": [\"number\", \"null\"] },\n        \"franchised_closed\": { \"type\": [\"number\", \"null\"] },\n        \"franchised_transferred\": { \"type\": [\"number\", \"null\"] },\n\n        \"company_opened\": { \"type\": [\"number\", \"null\"] },\n        \"company_closed\": { \"type\": [\"number\", \"null\"] }\n      },\n      \"required\": [\n        \"franchised_total\",\n        \"company_owned_total\",\n        \"total_systemwide\",\n        \"franchised_opened\",\n        \"franchised_closed\",\n        \"franchised_transferred\",\n        \"company_opened\",\n        \"company_closed\"\n      ]\n    },\n\n    \"franchisee_contact_list\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"present\": { \"type\": \"boolean\" },\n        \"where\": { \"type\": [\"string\", \"null\"] },\n        \"fields_listed\": {\n          \"type\": \"array\",\n          \"items\": { \"type\": \"string\" }\n        }\n      },\n      \"required\": [\"present\", \"where\", \"fields_listed\"]\n    },\n\n    \"notes\": { \"type\": [\"string\", \"null\"] },\n    \"issues\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } },\n    \"confidence_overall\": { \"type\": \"number\" }\n  },\n  \"required\": [\n    \"brand\",\n    \"year\",\n    \"as_of_date\",\n    \"outlets\",\n    \"franchisee_contact_list\",\n    \"notes\",\n    \"issues\",\n    \"confidence_overall\"\n  ]\n}\n"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -1616,
+        2288
+      ],
+      "id": "61788ff3-7234-4e89-b599-8cb2667eaaa4",
+      "name": "Structured Output Parser2"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5.2",
+          "mode": "list",
+          "cachedResultName": "gpt-5.2"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -1824,
+        2288
+      ],
+      "id": "ddd9987a-4bce-4dcd-bdaa-3bd92eed7152",
+      "name": "OpenAI Chat Model2",
+      "credentials": {
+        "openAiApi": {
+          "id": "6inYRlzBlcQUnddu",
+          "name": "Wes Stroud OpenAI Credential (n8n connection)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "id-1",
+              "name": "brand",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.brandName }}",
+              "type": "string"
+            },
+            {
+              "id": "id-2",
+              "name": "year",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.year }}",
+              "type": "string"
+            },
+            {
+              "id": "id-3",
+              "name": "startup_cost_low",
+              "value": "={{ $json.output.startup_cost_low }}",
+              "type": "number"
+            },
+            {
+              "id": "id-4",
+              "name": "startup_cost_high",
+              "value": "={{ $json.output.startup_cost_high }}",
+              "type": "number"
+            },
+            {
+              "id": "id-5",
+              "name": "royalty_percent",
+              "value": "={{ $json.output.royalty_percent }}",
+              "type": "number"
+            },
+            {
+              "id": "id-6",
+              "name": "royalty_minimum_monthly",
+              "value": "={{ $json.output.royalty_minimum_monthly }}",
+              "type": "number"
+            },
+            {
+              "id": "id-7",
+              "name": "brand_fund_percent",
+              "value": "={{ $json.output.brand_fund_percent }}",
+              "type": "number"
+            },
+            {
+              "id": "id-8",
+              "name": "initial_fees_paid_to_franchisor",
+              "value": "={{ $json.output.initial_fees_paid_to_franchisor }}",
+              "type": "number"
+            },
+            {
+              "id": "id-9",
+              "name": "alternate_royalty_structures",
+              "value": "={{ JSON.stringify($json.output.alternate_royalty_structures) }}",
+              "type": "string"
+            },
+            {
+              "id": "id-10",
+              "name": "issues",
+              "value": "={{ JSON.stringify($json.output.issues) }}",
+              "type": "string"
+            },
+            {
+              "id": "id-11",
+              "name": "confidence_overall",
+              "value": "={{ $json.output.confidence_overall }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "86022992-acce-4a80-8e3e-da726c4f017a",
+      "name": "Prepare Royalty Data for Supabase",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1408,
+        1072
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "id-1",
+              "name": "brand",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.brandName }}",
+              "type": "string"
+            },
+            {
+              "id": "id-2",
+              "name": "year",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.year }}",
+              "type": "string"
+            },
+            {
+              "id": "id-3",
+              "name": "reporting_period",
+              "value": "={{ $json.output.reporting_period }}",
+              "type": "string"
+            },
+            {
+              "id": "id-4",
+              "name": "unit_scope",
+              "value": "={{ $json.output.unit_scope }}",
+              "type": "string"
+            },
+            {
+              "id": "id-5",
+              "name": "basis",
+              "value": "={{ $json.output.basis }}",
+              "type": "string"
+            },
+            {
+              "id": "id-6",
+              "name": "median_revenue_usd",
+              "value": "={{ $json.output.median_revenue_usd }}",
+              "type": "number"
+            },
+            {
+              "id": "id-7",
+              "name": "top_revenue_usd",
+              "value": "={{ $json.output.top_revenue_usd }}",
+              "type": "number"
+            },
+            {
+              "id": "id-8",
+              "name": "median_metric_label",
+              "value": "={{ $json.output.median_metric_label }}",
+              "type": "string"
+            },
+            {
+              "id": "id-9",
+              "name": "top_metric_label",
+              "value": "={{ $json.output.top_metric_label }}",
+              "type": "string"
+            },
+            {
+              "id": "id-10",
+              "name": "sample_size",
+              "value": "={{ $json.output.sample_size }}",
+              "type": "number"
+            },
+            {
+              "id": "id-11",
+              "name": "notes",
+              "value": "={{ $json.output.notes }}",
+              "type": "string"
+            },
+            {
+              "id": "id-12",
+              "name": "issues",
+              "value": "={{ JSON.stringify($json.output.issues) }}",
+              "type": "string"
+            },
+            {
+              "id": "id-13",
+              "name": "confidence_overall",
+              "value": "={{ $json.output.confidence_overall }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "e0d37cd3-95f6-4c98-93c6-6ec025aa01a7",
+      "name": "Prepare Financials Data for Supabase",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1392,
+        1584
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "id-1",
+              "name": "brand",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.brandName }}",
+              "type": "string"
+            },
+            {
+              "id": "id-2",
+              "name": "year",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.year }}",
+              "type": "string"
+            },
+            {
+              "id": "id-3",
+              "name": "as_of_date",
+              "value": "={{ $json.output.as_of_date }}",
+              "type": "string"
+            },
+            {
+              "id": "id-4",
+              "name": "franchised_total",
+              "value": "={{ $json.output.outlets.franchised_total }}",
+              "type": "number"
+            },
+            {
+              "id": "id-5",
+              "name": "company_owned_total",
+              "value": "={{ $json.output.outlets.company_owned_total }}",
+              "type": "number"
+            },
+            {
+              "id": "id-6",
+              "name": "total_systemwide",
+              "value": "={{ $json.output.outlets.total_systemwide }}",
+              "type": "number"
+            },
+            {
+              "id": "id-7",
+              "name": "franchised_opened",
+              "value": "={{ $json.output.outlets.franchised_opened }}",
+              "type": "number"
+            },
+            {
+              "id": "id-8",
+              "name": "franchised_closed",
+              "value": "={{ $json.output.outlets.franchised_closed }}",
+              "type": "number"
+            },
+            {
+              "id": "id-9",
+              "name": "franchised_transferred",
+              "value": "={{ $json.output.outlets.franchised_transferred }}",
+              "type": "number"
+            },
+            {
+              "id": "id-10",
+              "name": "company_opened",
+              "value": "={{ $json.output.outlets.company_opened }}",
+              "type": "number"
+            },
+            {
+              "id": "id-11",
+              "name": "company_closed",
+              "value": "={{ $json.output.outlets.company_closed }}",
+              "type": "number"
+            },
+            {
+              "id": "id-12",
+              "name": "franchisee_contact_list_present",
+              "value": "={{ $json.output.franchisee_contact_list.present }}",
+              "type": "boolean"
+            },
+            {
+              "id": "id-13",
+              "name": "franchisee_contact_list_where",
+              "value": "={{ $json.output.franchisee_contact_list.where }}",
+              "type": "string"
+            },
+            {
+              "id": "id-14",
+              "name": "franchisee_contact_list_fields",
+              "value": "={{ JSON.stringify($json.output.franchisee_contact_list.fields_listed) }}",
+              "type": "string"
+            },
+            {
+              "id": "id-15",
+              "name": "notes",
+              "value": "={{ $json.output.notes }}",
+              "type": "string"
+            },
+            {
+              "id": "id-16",
+              "name": "issues",
+              "value": "={{ JSON.stringify($json.output.issues) }}",
+              "type": "string"
+            },
+            {
+              "id": "id-17",
+              "name": "confidence_overall",
+              "value": "={{ $json.output.confidence_overall }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "23289cf1-a5d2-4fa3-a819-ee809022a0bb",
+      "name": "Prepare Locations Data for Supabase",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1424,
+        2096
+      ]
+    },
+    {
+      "parameters": {
+        "tableId": "fdd_royalty_data",
+        "dataToSend": "autoMapInputData"
+      },
+      "id": "108aa03f-5df4-443f-8963-2e4f4e755215",
+      "name": "Insert Royalty Data to Supabase",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        -1184,
+        1072
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "pz8Td9qULXJZsrPk",
+          "name": "Supabase account 4"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "tableId": "fdd_financials_data",
+        "dataToSend": "autoMapInputData"
+      },
+      "id": "d36d47c1-1a65-49ee-a6fc-c3a90018e982",
+      "name": "Insert Financials Data to Supabase",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        -1168,
+        1584
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "pz8Td9qULXJZsrPk",
+          "name": "Supabase account 4"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "tableId": "fdd_locations_data",
+        "dataToSend": "autoMapInputData"
+      },
+      "id": "9aedc076-91a5-426d-8a45-7c9e6312a9a2",
+      "name": "Insert Locations Data to Supabase",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        -1200,
+        2096
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "pz8Td9qULXJZsrPk",
+          "name": "Supabase account 4"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-4.1-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -2416,
+        1760
+      ],
+      "id": "52c63e31-76b1-4b6c-8ee8-a65fa8c9d0ea",
+      "name": "OpenAI Chat Model3",
+      "credentials": {
+        "openAiApi": {
+          "id": "6inYRlzBlcQUnddu",
+          "name": "Wes Stroud OpenAI Credential (n8n connection)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"additionalProperties\": false,\n  \"required\": [\"category\", \"confidence\", \"evidence\"],\n  \"properties\": {\n    \"category\": {\n      \"type\": \"string\",\n      \"enum\": [\n        \"Food & Beverage\",\n        \"Health & Wellness\",\n        \"Child Enrichment\",\n        \"Senior Care\",\n        \"Home Services\",\n        \"B2B Services\",\n        \"Automotive\",\n        \"Retail\",\n        \"Hospitality\",\n        \"Property Services\",\n        \"Other\"\n      ]\n    },\n    \"confidence\": {\n      \"type\": \"number\",\n      \"minimum\": 0,\n      \"maximum\": 1\n    },\n    \"franchise_name\": { \"type\": \"string\" },\n    \"evidence\": {\n      \"type\": \"array\",\n      \"minItems\": 2,\n      \"maxItems\": 6,\n      \"items\": { \"type\": \"string\" }\n    },\n    \"notes\": { \"type\": \"string\" }\n  }\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -2176,
+        1760
+      ],
+      "id": "6b1cb3f9-4215-48e3-9e5a-e0990affbe6c",
+      "name": "Structured Output Parser3"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Here is the first page of the Franchise Disclosure Document (FDD).\nThis section typically describes the nature of the business, the services or products offered, and the primary customer type.\n\nUse this text as the PRIMARY source of truth for categorization:\n{{ $json.firstPageForAi }}\n\nAdditional context (use as secondary signals only):\n- Reported franchise name: {{ $('Webhook Upload FDD').item.json.body.brandName }}\n- User-suggested category (may be incorrect): {{ $('Webhook Upload FDD').item.json.body.category }}\n\nInstructions:\n- Base your decision primarily on the business activities and customer described in the FDD text.\n- Use the franchise name only to clarify ambiguity, not to override the text.\n- Treat the suggested category as a weak hint; override it if the text indicates a better fit.\n- Do NOT infer categories based on branding, buzzwords, or assumptions not supported by the text.\n- If the category is unclear from the provided text, select \"Other\" and assign a low confidence score.",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are a categorization agent. Choose exactly ONE category from the allowed list and output ONLY valid JSON matching the schema.\nBase your decision ONLY on the provided FDD first-page text and the provided context fields. If there is not enough information, choose \"Other\" with low confidence (<= 0.5).\nWhen deciding between similar categories:\n\nHome Services = primarily delivered at/for a home (repairs, cleaning, restoration, lawn, etc.)\n\nProperty Services = property maintenance/management/commercial facilities, multi-site, landlords, HOAs, multifamily, or commercial properties\n\nB2B Services = primarily serves businesses (not consumers)\n\nHospitality = lodging/travel/guest accommodations\n\nRetail = physical goods sold to consumers (storefront or e-commerce), not primarily services\nReturn 2–6 short evidence bullets quoting/echoing phrases from the text (no long excerpts)."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -2368,
+        1536
+      ],
+      "id": "3283ba72-6681-4f36-9a62-2c78ae2d345b",
+      "name": "Categorization Agent"
+    },
+    {
+      "parameters": {
+        "content": "## Categorization Agent\nReads the first page of a Franchise Disclosure Document (FDD) to determine the franchise’s primary business category based on what the business actually does and who it serves. Outputs a single standardized category with a confidence score and supporting evidence, flagging ambiguous cases for review.",
+        "height": 688,
+        "width": 384,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2432,
+        1296
+      ],
+      "id": "6fc769b5-aed5-41f2-b825-3f8f89a8f7f8",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## Receives FDD uploads from the Franchise Atlas site.\nAccepts PDF files submitted through the Franchise Atlas upload interface and forwards them into the ingestion pipeline with associated metadata.",
+        "height": 240,
+        "width": 288
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -3888,
+        1232
+      ],
+      "id": "67b6bf34-c056-4bc6-aae0-770c4f49ad3d",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "## Extracts and normalizes text from the uploaded FDD PDF.\nConverts the document into machine-readable text (OCR as needed) and parses it into smaller logical sections (e.g., Item 19) to enable lighter-weight, targeted AI analysis.",
+        "height": 272,
+        "width": 528
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -3552,
+        1200
+      ],
+      "id": "730de397-351c-4ac2-aed6-452d98d34339",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=TEXT (primary):\n{{ $json.firstPageForAi }}\n\nOther helpful context:\n- User reported franchise name: {{ $('Webhook Upload FDD').item.json.body.brandName }}",
+        "hasOutputParser": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -2944,
+        1504
+      ],
+      "id": "5d7d1ba6-a0b2-485e-9521-45f611d9dfcc",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-4.1-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -2960,
+        1712
+      ],
+      "id": "a0bee320-c145-4532-a50d-7adc1e35c4cb",
+      "name": "OpenAI Chat Model4",
+      "credentials": {
+        "openAiApi": {
+          "id": "6inYRlzBlcQUnddu",
+          "name": "Wes Stroud OpenAI Credential (n8n connection)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"additionalProperties\": false,\n  \"required\": [\"is_fdd\", \"brand_name\", \"fdd_year\", \"confidence\", \"reason\", \"date_source\", \"flags\"],\n  \"properties\": {\n    \"is_fdd\": { \"type\": \"boolean\" },\n    \"brand_name\": { \"type\": [\"string\", \"null\"] },\n    \"fdd_year\": { \"type\": [\"integer\", \"null\"], \"minimum\": 1900, \"maximum\": 2100 },\n    \"confidence\": { \"type\": \"number\", \"minimum\": 0, \"maximum\": 1 },\n    \"reason\": { \"type\": \"string\" },\n    \"date_source\": { \"type\": [\"string\", \"null\"] },\n    \"flags\": { \"type\": \"array\", \"items\": { \"type\": \"string\" }, \"maxItems\": 8 }\n  }\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -2784,
+        1712
+      ],
+      "id": "9e653b33-e74f-4527-b823-55853da29769",
+      "name": "Structured Output Parser4"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "e178eef3-3976-4a27-a3eb-fdddd2eebaa3",
+              "leftValue": "={{ $json.output.is_fdd }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "e58f8447-f525-49cb-9035-d93b01089d86",
+              "leftValue": "={{ $json.output.confidence }}",
+              "rightValue": 0.7,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -2608,
+        1504
+      ],
+      "id": "93a99455-1b6f-47a3-8ecb-023e6cdfc466",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "user",
+        "user": {
+          "__rl": true,
+          "value": "U08KV5KN29Y",
+          "mode": "id"
+        },
+        "text": "={{ $('AI Agent').item.json.output.reason }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        -2608,
+        1728
+      ],
+      "id": "0b991e02-806d-4184-93b7-dd8cf73566ca",
+      "name": "Send a message",
+      "webhookId": "9916637d-7a85-46a2-bd98-72b2d5eef578",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "VpAbBKOqbr3JnVcf",
+          "name": "Slack account 14"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Confirms the uploaded document is a Franchise Disclosure Document (FDD).\nUses structural language and standard FDD indicators to verify document type and extract core identifying details before downstream analysis.",
+        "height": 272,
+        "width": 448
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2960,
+        1200
+      ],
+      "id": "ca1ee800-1fcf-4d1a-8be9-6b7974655181",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "tableId": "fdd_brands",
+        "dataToSend": "autoMapInputData"
+      },
+      "id": "d6968ce2-21ed-4791-ac40-84ae4db2d59b",
+      "name": "Insert Brand Data to Supabase",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        -1184,
+        720
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "pz8Td9qULXJZsrPk",
+          "name": "Supabase account 4"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "id-1",
+              "name": "brand",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.brandName }}",
+              "type": "string"
+            },
+            {
+              "id": "id-2",
+              "name": "category",
+              "value": "={{ $json.output.category }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "9b749e6a-54b2-4a97-a803-08ac820f76f6",
+      "name": "Prepare Brand Data for Supabase",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1792,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Brand + Category Storage\nStores the franchise brand and its primary category based on the Categorization Agent output.\nCreates or updates a single brand record used as the parent reference for all downstream FDD data.",
+        "width": 720,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1792,
+        528
+      ],
+      "id": "69920d3f-2283-494d-bd4e-9b296360d6b2",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "content": "## Royalties & Fees (Item 6)\nParses Item 6 royalty and recurring fee structures and normalizes percentages vs flat fees.\nInserts structured records linked to the corresponding brand for unit economics analysis.",
+        "width": 720,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1792,
+        896
+      ],
+      "id": "cb2af992-078c-4131-a57a-f1c14bff8fc8",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "content": "## Financial Performance (Item 19)\nExtracts Item 19 financial representations including AUVs, ranges, and sample sizes.\nNormalizes values and stores them by brand to support franchise comparison and modeling.",
+        "width": 720,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1792,
+        1392
+      ],
+      "id": "edc92d68-c128-4bc5-aa98-71a14dd13ce9",
+      "name": "Sticky Note6"
+    },
+    {
+      "parameters": {
+        "content": "## Franchise Locations (Item 20)\nParses Item 20 system size and unit change data across franchised and company-owned locations.\nStores structured location records to enable growth and saturation analysis.",
+        "width": 720,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1792,
+        1904
+      ],
+      "id": "0ccfed17-855e-4556-a980-d68e61f6c3c6",
+      "name": "Sticky Note7"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Exhibit F (Part A) extractor + parser\n * Expects upstream fields:\n *  - item.json.brand\n *  - item.json.year\n *  - item.json.category\n *  - item.json.fdd_id (optional; if missing we compute it)\n * And text at:\n *  - item.json.text  OR  \"Extract from File\" -> json.text\n *\n * Outputs:\n *  - meta record (record_type=\"meta\")\n *  - location records (record_type=\"location\")\n */\n\nconst items = $input.all();\nconst outputs = [];\n\n// ---------------- Utilities ----------------\nconst toGlobalRegex = (re) => {\n  const flags = re.flags.includes(\"g\") ? re.flags : re.flags + \"g\";\n  return new RegExp(re.source, flags);\n};\n\nconst clipAround = (text, idx, radius = 400) => {\n  if (idx == null || idx < 0) return \"\";\n  const start = Math.max(0, idx - radius);\n  const end = Math.min(text.length, idx + radius);\n  return text.slice(start, end);\n};\n\nconst normalizeBrandForId = (s) =>\n  (s || \"\")\n    .toLowerCase()\n    .trim()\n    .replace(/&/g, \"and\")\n    .replace(/[^a-z0-9]+/g, \"_\")\n    .replace(/^_+|_+$/g, \"\");\n\nconst getDocumentText = (item) => {\n  if (typeof item?.json?.text === \"string\" && item.json.text.trim()) return item.json.text;\n\n  const extracted = $(\"Extract from File\")?.first()?.json?.text;\n  if (typeof extracted === \"string\" && extracted.trim()) return extracted;\n\n  // last resort: scan any items for text\n  for (const it of items) {\n    if (typeof it?.json?.text === \"string\" && it.json.text.trim()) return it.json.text;\n  }\n\n  return \"\";\n};\n\nconst findAllIndexes = (text, re) =>\n  [...text.matchAll(toGlobalRegex(re))].map((m) => m.index).filter((i) => i != null);\n\nconst lastIndexOfRegex = (text, re) => {\n  const idxs = findAllIndexes(text, re);\n  return idxs.length ? idxs[idxs.length - 1] : -1;\n};\n\n// ---------------- Patterns ----------------\nconst PART_B_FORMER =\n  /(?:^|\\n)\\s*Part\\s*B\\b[\\s\\S]{0,200}Former\\s+Franchisees|Former\\s+Franchisees\\s+Who\\s+Left\\s+System/i;\n\nconst PART_A = /(?:^|\\n)\\s*Part\\s*A\\b/i;\n\nconst HEADER_PART_A =\n  /(?:^|\\n)\\s*State\\s+City\\s+Address\\s+Phone\\s+Owner\\s+Name\\b/i;\n\nconst PHONE_RE =\n  /(?:\\(\\s*\\d{3}\\s*\\)\\s*|\\b\\d{3}[\\s.\\-]?)\\d{3}[\\s.\\-]?\\d{4}\\b/;\n\nconst ROW_START_STATE_RE = /^[A-Z]\\s*[A-Z]\\s+/m;\n\n// ---------------- Row parsing ----------------\nconst normalizeState = (s) => (s || \"\").replace(/\\s+/g, \"\").trim();\n\nconst parseRow = (row) => {\n  const text = (row || \"\").trim();\n  if (!text) return null;\n\n  // skip headers/labels\n  if (/^State\\s+City/i.test(text)) return null;\n  if (/^Part\\s+[A-Z]/i.test(text)) return null;\n  if (/^Exhibit\\s+F/i.test(text)) return null;\n  if (/^Franchise\\s+Disclosure\\s+Document/i.test(text)) return null;\n\n  const stateMatch = text.match(/^([A-Z]\\s*[A-Z])\\s+(.*)$/);\n  if (!stateMatch) return null;\n\n  const state = normalizeState(stateMatch[1]);\n  const rest = stateMatch[2];\n\n  const phoneMatch = rest.match(PHONE_RE);\n  if (!phoneMatch || phoneMatch.index == null) return null;\n\n  const telephoneRaw = phoneMatch[0];\n  const telephone = telephoneRaw.replace(/\\s+/g, \" \").trim();\n\n  const beforePhone = rest.slice(0, phoneMatch.index).trim();\n  const afterPhone = rest.slice(phoneMatch.index + telephoneRaw.length).trim();\n\n  let city = \"\";\n  let address = \"\";\n\n  if (/To Be Determined/i.test(beforePhone)) {\n    city = \"To Be Determined\";\n    address = \"To Be Determined\";\n  } else {\n    const digitIdx = beforePhone.search(/\\d/);\n    if (digitIdx > 0) {\n      city = beforePhone.slice(0, digitIdx).trim();\n      address = beforePhone.slice(digitIdx).trim();\n    } else {\n      city = beforePhone.trim();\n      address = \"\";\n    }\n  }\n\n  return {\n    state,\n    city,\n    address,\n    telephone,\n    franchisee_name: afterPhone.replace(/\\s+/g, \" \").trim(),\n  };\n};\n\nconst buildRows = (text) => {\n  const lines = (text || \"\").split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);\n  const rows = [];\n  let current = \"\";\n\n  for (const line of lines) {\n    if (ROW_START_STATE_RE.test(line)) {\n      if (current) rows.push(current.trim());\n      current = line;\n    } else {\n      current = current ? `${current} ${line}` : line;\n    }\n  }\n  if (current) rows.push(current.trim());\n  return rows;\n};\n\n// ---------------- Extraction ----------------\nconst extractPartA = (text) => {\n  const endIndex = text.search(PART_B_FORMER);\n  if (endIndex < 0) return null;\n\n  const lookback = text.slice(Math.max(0, endIndex - 900000), endIndex);\n  const partAIdx = lastIndexOfRegex(lookback, PART_A);\n  const headerIdx = lastIndexOfRegex(lookback, HEADER_PART_A);\n\n  const startIndex =\n    partAIdx >= 0\n      ? endIndex - lookback.length + partAIdx\n      : headerIdx >= 0\n      ? endIndex - lookback.length + headerIdx\n      : null;\n\n  if (startIndex == null) return null;\n\n  return {\n    startIndex,\n    endIndex,\n    text: text.slice(startIndex, endIndex).trim(),\n  };\n};\n\n// ---------------- MAIN ----------------\n// Use the first item as the “context carrier”\nconst ctx = items[0]?.json ?? {};\nconst brand = ctx.brand ?? null;\nconst year = ctx.year != null ? Number(String(ctx.year).trim()) : null;\nconst category = ctx.category ?? null;\n\n// Prefer upstream fdd_id, else compute\nconst fdd_id =\n  ctx.fdd_id ??\n  (brand && year ? `${normalizeBrandForId(brand)}_${year}` : null);\n\n// Parse once per run (one document)\nfor (const item of items) {\n  const fullText = getDocumentText(item);\n  if (!fullText) continue;\n\n  const extracted = extractPartA(fullText);\n  if (!extracted) continue;\n\n  let partAText = extracted.text;\n  const headerPos = partAText.search(HEADER_PART_A);\n  if (headerPos >= 0) partAText = partAText.slice(headerPos);\n\n  const rows = buildRows(partAText);\n\n  const locations = [];\n  for (const row of rows) {\n    const parsed = parseRow(row);\n    if (parsed) {\n      locations.push({\n        record_type: \"location\",\n        fdd_id,\n        brand,\n        year,\n        category,\n        source: \"EXHIBIT_F_PART_A\",\n        ...parsed,\n      });\n    }\n  }\n\n  outputs.push({\n    json: {\n      record_type: \"meta\",\n      fdd_id,\n      brand,\n      year,\n      category,\n\n      method: \"partB_anchor_last_partA_marker\",\n      startIndex: extracted.startIndex,\n      endIndex: extracted.endIndex,\n\n      textLen: fullText.length,\n      partALen: partAText.length,\n      logicalRowCount: rows.length,\n      franchiseeLocationsCount: locations.length,\n\n      sampleStart: partAText.slice(0, 1200),\n      startSnippet: clipAround(fullText, extracted.startIndex),\n      endSnippet: clipAround(fullText, extracted.endIndex),\n    },\n  });\n\n  for (const loc of locations) outputs.push({ json: loc });\n\n  break; // only one doc\n}\n\nreturn outputs;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2912,
+        2256
+      ],
+      "id": "6fd8105e-7a37-46a5-9fd8-63840335f792",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "68a7b504-dc01-494c-8287-18d6a4496808",
+              "name": "brand",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.brandName }}",
+              "type": "string"
+            },
+            {
+              "id": "8b2884ed-23db-44a2-8884-cfbc0c599326",
+              "name": "year",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.year }}",
+              "type": "string"
+            },
+            {
+              "id": "f4689bb6-792e-4f34-88d3-a19ff1aa4006",
+              "name": "category",
+              "value": "={{ $('Webhook Upload FDD').item.json.body.category }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -3120,
+        2256
+      ],
+      "id": "58954a88-a194-4c2e-9bdb-f8aeaaeac50d",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "4e128bc5-b9e0-4a1b-95c1-09d2b974bec1",
+              "leftValue": "={{$json.record_type}}",
+              "rightValue": "meta",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -2688,
+        2144
+      ],
+      "id": "de774f50-5bd9-43ea-99cd-f61b83e7f363",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require(\"crypto\");\n\nreturn $input.all()\n  // optional: only hash location rows\n  .filter(item => item?.json?.record_type === \"location\")\n  .map((item) => {\n    const j = item.json || {};\n\n    const parts = [\n      j.fdd_id,\n      j.source,\n      j.state,\n      j.city,\n      j.address,\n      j.telephone,\n      j.franchisee_name,\n    ].map(v => (v ?? \"\").toString().trim().toLowerCase());\n\n    const row_hash = crypto\n      .createHash(\"sha256\")\n      .update(parts.join(\"|\"))\n      .digest(\"hex\");\n\n    return { json: { ...j, row_hash } };\n  });"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2448,
+        2272
+      ],
+      "id": "614fd4dc-8500-4eb3-b31f-66132425638c",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "tableId": "fdd_franchisee_locations",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "fdd_id",
+              "fieldValue": "={{ $json.fdd_id }}"
+            },
+            {
+              "fieldId": "source",
+              "fieldValue": "={{ $json.source }}"
+            },
+            {
+              "fieldId": "state",
+              "fieldValue": "={{ $json.state }}"
+            },
+            {
+              "fieldId": "address",
+              "fieldValue": "={{ $json.address }}"
+            },
+            {
+              "fieldId": "telephone",
+              "fieldValue": "={{ $json.telephone }}"
+            },
+            {
+              "fieldId": "franchisee_name",
+              "fieldValue": "={{ $json.franchisee_name }}"
+            },
+            {
+              "fieldId": "row_hash",
+              "fieldValue": "={{ $json.row_hash }}"
+            },
+            {
+              "fieldId": "city",
+              "fieldValue": "={{ $json.city }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        -2240,
+        2272
+      ],
+      "id": "3d70da76-0eb8-4992-9f7a-9773679da359",
+      "name": "Create a row",
+      "retryOnFail": false,
+      "credentials": {
+        "supabaseApi": {
+          "id": "pz8Td9qULXJZsrPk",
+          "name": "Supabase account 4"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Normalize Exhibit F output.\nClean and structure extracted Part A rows, attach brand/year/fdd_id context, and standardize location fields before filtering and hashing.",
+        "height": 176,
+        "width": 336
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -3136,
+        2048
+      ],
+      "id": "1da08d84-0ed3-4163-ac21-41e0af177886",
+      "name": "Sticky Note8"
+    },
+    {
+      "parameters": {
+        "content": "## Franchisee Location Path",
+        "width": 150
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -3456,
+        1888
+      ],
+      "id": "d8b95b69-17e8-450e-bdd1-a10b943d677d",
+      "name": "Sticky Note9"
+    },
+    {
+      "parameters": {
+        "content": "## Filter to location rows only.\nPass only record_type = \"location\" items downstream so we don’t attempt to hash or insert meta/debug records into Supabase.",
+        "width": 304
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2784,
+        1968
+      ],
+      "id": "c18eb12f-f5ee-4e88-848e-994bbc4080f7",
+      "name": "Sticky Note10"
+    },
+    {
+      "parameters": {
+        "content": "## Generate deterministic row_hash + insert into Supabase.\nCreate a SHA256 hash from key location fields to prevent duplicates, then insert each location row into the franchisee_locations table.",
+        "height": 176,
+        "width": 368
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2448,
+        2080
+      ],
+      "id": "d8ae9038-bff5-4079-bea8-f0d7f51beb26",
+      "name": "Sticky Note11"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Convert FDD to Text",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert FDD to Text": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Royalty Parser (Items 6 and 7)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Royalty Parser (Items 6 and 7)",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser1": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Financials Parser (Item 19)",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Financials Parser (Item 19)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser2": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Locations Parser (Item 20)",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Locations Parser (Item 20)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Royalty Parser (Items 6 and 7)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Royalty Data for Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Royalty Data for Supabase": {
+      "main": [
+        [
+          {
+            "node": "Insert Royalty Data to Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Financials Parser (Item 19)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Financials Data for Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Financials Data for Supabase": {
+      "main": [
+        [
+          {
+            "node": "Insert Financials Data to Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Locations Parser (Item 20)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Locations Data for Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Locations Data for Supabase": {
+      "main": [
+        [
+          {
+            "node": "Insert Locations Data to Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Upload FDD": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model3": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Categorization Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser3": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Categorization Agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Categorization Agent": {
+      "main": [
+        [
+          {
+            "node": "Royalty Parser (Items 6 and 7)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Financials Parser (Item 19)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Locations Parser (Item 20)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Brand Data for Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model4": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser4": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Categorization Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Brand Data for Supabase": {
+      "main": [
+        [
+          {
+            "node": "Insert Brand Data to Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "Create a row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "f4304ff4-48c5-463b-bf37-648dd4eaab63",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "dc2f41b0f3697394e32470f5727b760961a15df0a6ed2f8c99e372996569754a"
+  },
+  "id": "fQnavkqSiCsDH9ELo3MOg",
+  "tags": []
+}
