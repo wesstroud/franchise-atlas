@@ -10,6 +10,7 @@ const schema = z.object({
   OPENAI_MODEL_CATEGORY: z.string().default("gpt-4.1-mini"),
   OPENAI_MODEL_EXTRACT: z.string().default("gpt-5.2"),
   FDD_CONFIDENCE_THRESHOLD: z.coerce.number().default(0.7),
+  CORS_ORIGIN: z.string().default("*"),
   LOG_LEVEL: z.string().default("info")
 });
 

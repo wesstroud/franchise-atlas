@@ -1,9 +1,16 @@
 import express from "express";
+import cors from "cors";
 import { env } from "./config/env.js";
 import { logger } from "./lib/logger.js";
 import { fddRouter } from "./routes/fdd.routes.js";
 
 const app = express();
+
+app.use(
+  cors({
+    origin: env.CORS_ORIGIN === "*" ? true : env.CORS_ORIGIN
+  })
+);
 
 app.use((req, res, next) => {
   const start = Date.now();
